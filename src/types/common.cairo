@@ -1,6 +1,6 @@
 use starknet::ContractAddress;
 
-#[derive(Drop,starknet::Store, Serde)]
+#[derive(Drop,starknet::Store, Serde, Copy)]
 pub struct Mandate {
     pub executor_public_key: felt252,
     pub pay_to: ContractAddress,

@@ -39,7 +39,14 @@ pub mod MandateAccountComponent {
     #[derive(Drop, PartialEq, starknet::Event)]
     pub enum Event {
         OwnerAdded: OwnerAdded,
-        OwnerRemoved: OwnerRemoved
+        OwnerRemoved: OwnerRemoved,
+        MandateAdded: MandateAdded,
+        MandateRemoved: MandateRemoved,
+        MandateExecuted: MandateExecuted,
+        InvalidMandateCalled: InvalidMandateCalled,
+        ExpiredMandateCalled: ExpiredMandateCalled,
+        InvalidMandateDay: InvalidMandateDay,
+        MandateReexecutionAttempt: MandateReexecutionAttempt
     }
 
     #[derive(Drop, PartialEq, starknet::Event)]
@@ -54,11 +61,65 @@ pub mod MandateAccountComponent {
         pub removed_owner_guid: felt252
     }
 
+    #[derive(Drop, PartialEq, starknet::Event)]
+    pub struct MandateAdded {
+        #[key]
+        pub executor_pub_key: felt252,
+        pub mandate_id: u128
+    }
+
+    #[derive(Drop, PartialEq, starknet::Event)]
+    pub struct MandateRemoved {
+        #[key]
+        pub executor_pub_key: felt252,
+        pub mandate_id: u128
+    }
+
+    #[derive(Drop, PartialEq, starknet::Event)]
+    pub struct MandateExecuted {
+        #[key]
+        pub executor_pub_key: felt252,
+        pub mandate_id:u128
+    }
+
+    #[derive(Drop, PartialEq, starknet::Event)]
+    pub struct InvalidMandateCalled {
+        #[key]
+        pub executor_pub_key: felt252,
+        pub mandate_id: u128
+    }
+
+    #[derive(Drop, PartialEq, starknet::Event)]
+    pub struct InvalidMandateDay {
+        #[key]
+        pub executor_pub_key: felt252,
+        pub mandate_id: u128,
+        pub day: u64
+    }
+
+    #[derive(Drop, PartialEq, starknet::Event)]
+    pub struct ExpiredMandateCalled{
+        #[key]
+        pub executor_pub_key: felt252,
+        pub mandate_id: u128,
+        pub valid_till_timestamp: u64,
+        pub executed_at_timestamp: u64
+    }
+
+    #[derive(Drop, PartialEq, starknet::Event)]
+    pub struct MandateReexecutionAttempt {
+        #[key]
+        pub executor_pub_key: felt252,
+        pub mandate_id: u128,
+        pub day: u64
+    }
+
     pub mod Errors {
         pub const INVALID_CALLER: felt252 = 'Account: invalid caller';
         pub const INVALID_SIGNATURE: felt252 = 'Account: invalid signature';
         pub const INVALID_TX_VERSION: felt252 = 'Account: invalid tx version';
         pub const UNAUTHORIZED: felt252 = 'Account: unauthorized';
+        pub const INVALID_MANDATE: felt252 = 'Account: invalid mandate';
         pub const INVALID_MANDATE_ID: felt252 = 'Account: invalid mandate id';
         pub const MANDATE_INACTIVE: felt252 = 'Account: mandate removed';
         pub const MANDATE_EXPIRED: felt252 = 'Account: mandate expired';
@@ -79,53 +140,104 @@ pub mod MandateAccountComponent {
     > of IPaymentMandate<ComponentState<TContractState>> {
 
         fn add_mandate(ref self: ComponentState<TContractState>, mandate: Mandate) -> u128 {
-
             self.assert_only_self();
+            assert(self.validate_mandate(@mandate), Errors::INVALID_MANDATE);
             let num_mandates = self.Account_num_mandates.read();
-            self.Account_mandates.write(num_mandates, mandate);
+            let updated_mandate = Mandate {
+                num_executed:0, last_executed_timestamp:0, is_active: true, ..mandate
+            };
+            self.Account_mandates.write(num_mandates, updated_mandate);
             self.Account_num_mandates.write(num_mandates+1);
-            
+            self.emit(MandateAdded{executor_pub_key: updated_mandate.executor_public_key, mandate_id: num_mandates});
             return num_mandates;
         }
 
         fn remove_mandate(ref self: ComponentState<TContractState>, mandate_id: u128) {
-
             self.assert_only_self();
             let mut mandate = self.Account_mandates.read(mandate_id);
-            //mandate.status = false;
-            self.Account_mandates.write(mandate_id, mandate);
-
+            let updated_mandate = Mandate {
+                is_active: false, ..mandate
+            };
+            self.Account_mandates.write(mandate_id, updated_mandate);
+            self.emit(MandateRemoved{executor_pub_key: updated_mandate.executor_public_key, mandate_id: mandate_id});
         }
 
-        fn execute_mandate(ref self: ComponentState<TContractState>, mandate_id: u128) {
+        fn execute_mandate(ref self: ComponentState<TContractState>, mandate_id: u128) -> bool {
             
             self.assert_only_self();
 
+            // This should always be true because mandate_id is checked during validation phase
             assert(mandate_id < self.Account_num_mandates.read(), Errors::INVALID_MANDATE_ID);
-            // Check whether mandate can be executed
+            // We deliberately deactivate the mandate
+            // Hence, if executor tries to maliciously drain gas by executing invalid mandate then
+            // he can only do so once and then the mandate will just remain invalid
             let mut mandate:Mandate = self.Account_mandates.read(mandate_id);
 
-            assert(mandate.is_active, Errors::MANDATE_INACTIVE);
+            let mut updated_mandate = Mandate {
+                is_active: false, ..mandate
+            };
+            self.Account_mandates.write(mandate_id, updated_mandate);
+
+            if !mandate.is_active {
+                self.emit(InvalidMandateCalled{executor_pub_key: mandate.executor_public_key, mandate_id: mandate_id});
+                return false;
+            }
+
+            // Re-read mandate from storage
+            let mut mandate:Mandate = self.Account_mandates.read(mandate_id);
+
             let current_timestamp = get_block_timestamp();
-            assert(current_timestamp <= mandate.valid_till_timestamp, Errors::MANDATE_EXPIRED);
+
+            if current_timestamp > mandate.valid_till_timestamp {
+                self.emit(ExpiredMandateCalled{
+                    executor_pub_key: mandate.executor_public_key, 
+                    mandate_id: mandate_id,
+                    valid_till_timestamp: mandate.valid_till_timestamp,
+                    executed_at_timestamp: get_block_timestamp()
+                });
+                return false;
+            }
+           
             
             let mandate_date = get_date(current_timestamp);
+            if (mandate_date.day != mandate.day_of_month) {
 
-            assert(mandate_date.day == mandate.day_of_month, Errors::INVALID_MANDATE_DAY );
-            assert(
-                !self.Account_mandate_execution_status.read(
-                    (mandate_id, mandate_date.year, mandate_date.month, mandate_date.day)),
-                Errors::MANDATE_ALREADY_EXECUTED
-            );
+                self.emit(InvalidMandateDay{
+                    executor_pub_key: mandate.executor_public_key, 
+                    mandate_id: mandate_id,
+                    day: mandate_date.day
+                });
+                return false;
+            }
+            
+            if self.Account_mandate_execution_status.read(
+                    (mandate_id, mandate_date.year, mandate_date.month, mandate_date.day)) {
+
+                self.emit(MandateReexecutionAttempt{
+                    executor_pub_key: mandate.executor_public_key, 
+                    mandate_id: mandate_id,
+                    day: mandate_date.day
+                });
+                return false;
+            }
             
             let erc20_currency = IERC20Dispatcher {contract_address: mandate.currency_address};
             erc20_currency.transfer(mandate.pay_to, mandate.amount);
-            mandate.num_executed = mandate.num_executed + 1;
-            mandate.last_executed_timestamp = get_block_timestamp();
-            self.Account_mandates.write(mandate_id, mandate);
+
+            let updated_mandate = Mandate {
+                num_executed: mandate.num_executed + 1,
+                last_executed_timestamp: get_block_timestamp(),
+                is_active: true,
+                ..mandate
+            };
+           
+            self.Account_mandates.write(mandate_id, updated_mandate);
             self.Account_mandate_execution_status.write(
                 (mandate_id, mandate_date.year, mandate_date.month, mandate_date.day), true
             );
+
+            self.emit(MandateExecuted{executor_pub_key: updated_mandate.executor_public_key, mandate_id: mandate_id});
+            return true;
         }
     }
 
@@ -179,6 +291,7 @@ pub mod MandateAccountComponent {
             if self._is_valid_signature(hash, signature.span()) {
                 starknet::VALIDATED
             } else {
+                // TODO: Check is signature is by a whitelisted key
                 0
             }
         }
@@ -424,18 +537,19 @@ pub mod MandateAccountComponent {
             assert(is_valid, Errors::INVALID_SIGNATURE);
         }
 
-        /// Validates the signature for the current transaction.
+        /// Validates the mandate signature for the current transaction 
         /// Returns the short string `VALID` if valid, otherwise it reverts.
         fn validate_transaction_with_mandate(self: @ComponentState<TContractState>, mut tx_calls: Array<Call>) -> felt252 {
             let tx_info = get_tx_info().unbox();
             let tx_hash = tx_info.transaction_hash;
             let signature = tx_info.signature;
             let mut calls = tx_calls.span();
-            // check for valid signature based on stored account key
-            // else check if pub key recovered matches a whitelisted mandate executor public key
+            // check if pub key recovered matches a whitelisted mandate executor public key
             // then check if call is to self only and only to execute_mandate selector
             let owner_sig_valid = self._is_valid_signature(tx_hash, signature);
 
+            // We check for account owner signature first so that it is the most efficient and does not spend gas
+            // doing potentially unnecessary work
             if owner_sig_valid {
                 return starknet::VALIDATED;
             }
@@ -446,32 +560,43 @@ pub mod MandateAccountComponent {
                 let self_address = get_contract_address();
                 let mut possible_pub_key_1=0;
                 let mut possible_pub_key_2=0;
+                // recover public keys for both possible parities
                 let r_possible_pub_key_1 = recover_public_key(tx_hash, *signature.at(0_u32), *signature.at(1_u32), true);
                 let r_possible_pub_key_2 = recover_public_key(tx_hash, *signature.at(0_u32), *signature.at(1_u32), false);
-                if r_possible_pub_key_1 == Option::None {
-                    possible_pub_key_1 == 0;
-                }
-                else {
-                    possible_pub_key_1 = r_possible_pub_key_1.unwrap();
-                }
 
-                if r_possible_pub_key_2 == Option::None {
-                    possible_pub_key_2 == 0;
-                }
-                else {
-                    possible_pub_key_2 = r_possible_pub_key_2.unwrap();
-                }
+                possible_pub_key_1 = match r_possible_pub_key_1 {
+                    Option::None => 0,
+                    Option::Some(key) => key
+                };
+
+                possible_pub_key_2 = match r_possible_pub_key_2 {
+                    Option::None => 0,
+                    Option::Some(key) => key
+                };
+                
+                // We must find atleast one valid key
                 assert(possible_pub_key_1.is_non_zero() || possible_pub_key_2.is_non_zero(), Errors::INVALID_SIGNATURE);
 
                 let mut actual_public_key:felt252 = 0;
+
+                // Check all calls
+                // Specifically, every 'to' address must be this very contract with selector for 'execute_mandate' only
+                // Also, extract mandate_id from the calldata and check that the public key for that mandate matches with 
+                // one of the keys recovered from the signature
+                // Additionally, key for every mandate must be the same to ensure that only authorized mandates are executed
+
                 while let Option::Some(call) = calls.pop_front() {
-                    assert(*call.to == self_address, 'MANDATE CALL NOT TO SELF');
-                    assert(*call.selector == selector!("execute_mandate"), 'INVALID MANDATE CALL');
+                    assert(*call.to == self_address, Errors::INVALID_MANDATE);
+                    assert(*call.selector == selector!("execute_mandate"), Errors::INVALID_MANDATE);
                     let mandate_id:u128 = (*((*call.calldata).at(0))).try_into().unwrap();
+
+                    assert(mandate_id < self.Account_num_mandates.read(), Errors::INVALID_MANDATE_ID);
                     let mandate:Mandate = self.Account_mandates.read(mandate_id);
+                    assert(mandate.is_active, Errors::MANDATE_INACTIVE);
 
                     if actual_public_key !=0 && actual_public_key!=mandate.executor_public_key {
                         // Calls to mandates with different public keys
+                        // Means executor trying to execute someone else's mandate
                         assert(false, Errors::INVALID_SIGNATURE);
                     }
                     if actual_public_key == 0 {
@@ -484,6 +609,13 @@ pub mod MandateAccountComponent {
             }
             assert(false, Errors::INVALID_SIGNATURE);
             starknet::VALIDATED
+        }
+
+        fn validate_mandate(self: @ComponentState<TContractState>, mandate: @Mandate) -> bool {
+            if *mandate.day_of_month > 31 || *mandate.day_of_month < 1 {
+                return false;
+            }
+            true
         }
 
         fn validate_transaction(self: @ComponentState<TContractState>) -> felt252 {
