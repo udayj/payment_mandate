@@ -10,6 +10,7 @@ pub mod MandateAccountComponent {
     use core::num::traits::Zero;
     use core::poseidon::PoseidonTrait;
     use core::ecdsa::recover_public_key;
+    use core::traits::TryInto;
     use openzeppelin::account::interface;
     use openzeppelin::account::utils::{MIN_TRANSACTION_VERSION, QUERY_VERSION, QUERY_OFFSET};
     use openzeppelin::account::utils::{execute_calls, is_valid_stark_signature};
@@ -23,13 +24,15 @@ pub mod MandateAccountComponent {
     use starknet::get_tx_info;
     use starknet::get_block_timestamp;
     use payment_mandate::interfaces::imandate::IPaymentMandate;
-    use payment_mandate::types::common::Mandate;
+    use payment_mandate::types::common::{Mandate, Date};
+    use payment_mandate::utils::get_date;
 
     #[storage]
     struct Storage {
         Account_public_key: felt252,
         Account_mandates: LegacyMap<u128,Mandate>,
         Account_num_mandates: u128,
+        Account_mandate_execution_status: LegacyMap<(u128, u64, u64, u64), bool>
     }
 
     #[event]
@@ -56,6 +59,11 @@ pub mod MandateAccountComponent {
         pub const INVALID_SIGNATURE: felt252 = 'Account: invalid signature';
         pub const INVALID_TX_VERSION: felt252 = 'Account: invalid tx version';
         pub const UNAUTHORIZED: felt252 = 'Account: unauthorized';
+        pub const INVALID_MANDATE_ID: felt252 = 'Account: invalid mandate id';
+        pub const MANDATE_INACTIVE: felt252 = 'Account: mandate removed';
+        pub const MANDATE_EXPIRED: felt252 = 'Account: mandate expired';
+        pub const INVALID_MANDATE_DAY: felt252 = 'Account: invalid mandate day';
+        pub const MANDATE_ALREADY_EXECUTED: felt252 = 'Account: mandate cycle executed';
     }
 
     //
@@ -93,12 +101,31 @@ pub mod MandateAccountComponent {
             
             self.assert_only_self();
 
+            assert(mandate_id < self.Account_num_mandates.read(), Errors::INVALID_MANDATE_ID);
             // Check whether mandate can be executed
             let mut mandate:Mandate = self.Account_mandates.read(mandate_id);
+
+            assert(mandate.is_active, Errors::MANDATE_INACTIVE);
+            let current_timestamp = get_block_timestamp();
+            assert(current_timestamp <= mandate.valid_till_timestamp, Errors::MANDATE_EXPIRED);
+            
+            let mandate_date = get_date(current_timestamp);
+
+            assert(mandate_date.day == mandate.day_of_month, Errors::INVALID_MANDATE_DAY );
+            assert(
+                !self.Account_mandate_execution_status.read(
+                    (mandate_id, mandate_date.year, mandate_date.month, mandate_date.day)),
+                Errors::MANDATE_ALREADY_EXECUTED
+            );
+            
             let erc20_currency = IERC20Dispatcher {contract_address: mandate.currency_address};
             erc20_currency.transfer(mandate.pay_to, mandate.amount);
             mandate.num_executed = mandate.num_executed + 1;
             mandate.last_executed_timestamp = get_block_timestamp();
+            self.Account_mandates.write(mandate_id, mandate);
+            self.Account_mandate_execution_status.write(
+                (mandate_id, mandate_date.year, mandate_date.month, mandate_date.day), true
+            );
         }
     }
 
@@ -440,7 +467,7 @@ pub mod MandateAccountComponent {
                 while let Option::Some(call) = calls.pop_front() {
                     assert(*call.to == self_address, 'MANDATE CALL NOT TO SELF');
                     assert(*call.selector == selector!("execute_mandate"), 'INVALID MANDATE CALL');
-                    let mandate_id:u128 = *(*call.calldata).at(0).into();
+                    let mandate_id:u128 = (*((*call.calldata).at(0))).try_into().unwrap();
                     let mandate:Mandate = self.Account_mandates.read(mandate_id);
 
                     if actual_public_key !=0 && actual_public_key!=mandate.executor_public_key {
