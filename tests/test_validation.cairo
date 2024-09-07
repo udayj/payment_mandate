@@ -15,11 +15,13 @@ use openzeppelin::tests::utils;
 use openzeppelin::token::erc20::interface::{IERC20DispatcherTrait, IERC20Dispatcher};
 use openzeppelin::utils::selectors;
 use openzeppelin::utils::serde::SerializedAppend;
+use super::erc20::ERC20Upgradeable;
 use starknet::ContractAddress;
 use starknet::account::Call;
 use starknet::contract_address_const;
 use starknet::testing;
 use starknet::get_contract_address;
+use starknet::syscalls::{deploy_syscall, call_contract_syscall};
 use super::constants::{
     PUBKEY, NEW_PUBKEY, SALT, ZERO, QUERY_OFFSET, QUERY_VERSION, MIN_TRANSACTION_VERSION
 };
@@ -60,6 +62,16 @@ fn setup() -> ComponentState {
     state
 }
 
+fn deploy(
+    contract_class_hash: felt252, salt: felt252, calldata: Array<felt252>
+) -> ContractAddress {
+    let (address, _) = deploy_syscall(
+        contract_class_hash.try_into().unwrap(), salt, calldata.span(), false
+    )
+        .unwrap();
+    address
+}
+
 fn setup_dispatcher(
     data: Option<@SignedTransactionData>
 ) -> (MandateAccountABIDispatcher, ContractAddress) {
@@ -71,7 +83,7 @@ fn setup_dispatcher(
         testing::set_signature(array![*data.r, *data.s].span());
         testing::set_transaction_hash(*data.transaction_hash);
         calldata.append(PUBKEY);
-        //calldata.append(*data.public_key);
+    //calldata.append(*data.public_key);
     } else {
         calldata.append(PUBKEY);
     }
@@ -79,23 +91,22 @@ fn setup_dispatcher(
     (MandateAccountABIDispatcher { contract_address: address }, address)
 }
 
-#[test]
-fn test_is_valid_signature() {
-    let mut state = COMPONENT_STATE();
-    let data = SIGNED_TX_DATA();
-    let hash = data.transaction_hash;
+fn deploy_erc20(recipient: ContractAddress) -> (IERC20Dispatcher, ContractAddress) {
+    let owner: ContractAddress = contract_address_const::<100>();
+    let name: ByteArray = "ERC20";
+    let symbol: ByteArray = "TKT";
+    let fixed_supply: u256 = 100;
 
-    let mut good_signature = array![data.r, data.s];
-    let mut bad_signature = array![0x987, 0x564];
-
-    state._set_public_key(data.public_key);
-
-    let is_valid = state.is_valid_signature(hash, good_signature);
-    assert_eq!(is_valid, starknet::VALIDATED);
-
-    let is_valid = state.is_valid_signature(hash, bad_signature);
-    assert!(is_valid.is_zero(), "Should reject invalid signature");
+    let mut calldata = ArrayTrait::<felt252>::new();
+    name.serialize(ref calldata);
+    symbol.serialize(ref calldata);
+    fixed_supply.serialize(ref calldata);
+    recipient.serialize(ref calldata);
+    owner.serialize(ref calldata);
+    let erc20_token_address = deploy(ERC20Upgradeable::TEST_CLASS_HASH, 1, calldata);
+    return (IERC20Dispatcher { contract_address: erc20_token_address }, erc20_token_address);
 }
+
 
 #[test]
 fn test_is_valid_mandate_signature() {
@@ -103,9 +114,6 @@ fn test_is_valid_mandate_signature() {
     let data = SIGNED_TX_DATA();
     let (account, account_address) = setup_dispatcher(Option::Some(@data));
     let hash = data.transaction_hash;
-
-    let mut good_signature = array![data.r, data.s];
-    let mut bad_signature = array![0x987, 0x564];
 
     testing::set_contract_address(account_address);
     let mandate_id = account
@@ -123,7 +131,6 @@ fn test_is_valid_mandate_signature() {
             }
         );
 
-    println!("Mandate id:{}", mandate_id);
     let mut calldata = array![];
 
     mandate_id.serialize(ref calldata);
@@ -135,13 +142,8 @@ fn test_is_valid_mandate_signature() {
 
     let is_valid = account.__validate__(calls);
     assert_eq!(is_valid, starknet::VALIDATED);
-//let is_valid = state.is_valid_signature(hash, bad_signature);
-//assert!(is_valid.is_zero(), "Should reject invalid signature");
 }
-// check whether mandate is validated correctly
-// check whether mandate is invalidated correctly
-// check whether mandate can be executed - deploy some ERC20, give balance to account holder
-// check whether mandate execution is halted correctly
+
 #[test]
 #[should_panic(expected: ('Account: invalid signature', 'ENTRYPOINT_FAILED'))]
 fn test_invalid_mandate_signature() {
@@ -150,14 +152,11 @@ fn test_invalid_mandate_signature() {
     let (account, account_address) = setup_dispatcher(Option::Some(@data));
     let hash = data.transaction_hash;
 
-    let mut good_signature = array![data.r, data.s];
-    let mut bad_signature = array![0x987, 0x564];
-
     testing::set_contract_address(account_address);
     let mandate_id = account
         .add_mandate(
             Mandate {
-                executor_public_key: data.public_key+100,
+                executor_public_key: data.public_key + 100,
                 pay_to: contract_address_const::<0x4567>(),
                 currency_address: contract_address_const::<0x1234>(),
                 amount: 100,
@@ -169,7 +168,6 @@ fn test_invalid_mandate_signature() {
             }
         );
 
-    println!("Mandate id:{}", mandate_id);
     let mut calldata = array![];
 
     mandate_id.serialize(ref calldata);
@@ -181,8 +179,6 @@ fn test_invalid_mandate_signature() {
 
     let is_valid = account.__validate__(calls);
     assert_eq!(is_valid, starknet::VALIDATED);
-//let is_valid = state.is_valid_signature(hash, bad_signature);
-//assert!(is_valid.is_zero(), "Should reject invalid signature");
 }
 
 #[test]
@@ -192,9 +188,6 @@ fn test_invalid_mandate_id() {
     let data = SIGNED_TX_DATA();
     let (account, account_address) = setup_dispatcher(Option::Some(@data));
     let hash = data.transaction_hash;
-
-    let mut good_signature = array![data.r, data.s];
-    let mut bad_signature = array![0x987, 0x564];
 
     testing::set_contract_address(account_address);
     let mandate_id = account
@@ -224,8 +217,6 @@ fn test_invalid_mandate_id() {
 
     let is_valid = account.__validate__(calls);
     assert_eq!(is_valid, starknet::VALIDATED);
-//let is_valid = state.is_valid_signature(hash, bad_signature);
-//assert!(is_valid.is_zero(), "Should reject invalid signature");
 }
 
 #[test]
@@ -235,9 +226,6 @@ fn test_invalid_mandate_to() {
     let data = SIGNED_TX_DATA();
     let (account, account_address) = setup_dispatcher(Option::Some(@data));
     let hash = data.transaction_hash;
-
-    let mut good_signature = array![data.r, data.s];
-    let mut bad_signature = array![0x987, 0x564];
 
     testing::set_contract_address(account_address);
     let mandate_id = account
@@ -255,18 +243,71 @@ fn test_invalid_mandate_to() {
             }
         );
 
-    let new_mandate_id = mandate_id + 1;
     let mut calldata = array![];
 
     mandate_id.serialize(ref calldata);
     let call = Call {
-        to: contract_address_const::<0x4567>(), selector: selector!("execute_mandate"), calldata: calldata.span()
+        to: contract_address_const::<0x4567>(),
+        selector: selector!("execute_mandate"),
+        calldata: calldata.span()
     };
     let mut calls = array![];
     calls.append(call);
 
     let is_valid = account.__validate__(calls);
     assert_eq!(is_valid, starknet::VALIDATED);
-//let is_valid = state.is_valid_signature(hash, bad_signature);
-//assert!(is_valid.is_zero(), "Should reject invalid signature");
+}
+
+#[test]
+fn test_valid_mandate_execution() {
+    let mut state = COMPONENT_STATE();
+    let data = SIGNED_TX_DATA();
+    let (account, account_address) = setup_dispatcher(Option::Some(@data));
+    let (erc20, erc20_address) = deploy_erc20(account_address);
+    let hash = data.transaction_hash;
+
+    let mut good_signature = array![data.r, data.s];
+    let mut bad_signature = array![0x987, 0x564];
+
+    testing::set_contract_address(account_address);
+    let recipient = contract_address_const::<0x4567>();
+    let sent_amount: u256 = 40;
+    let mandate_id = account
+        .add_mandate(
+            Mandate {
+                executor_public_key: data.public_key,
+                pay_to: recipient,
+                currency_address: erc20_address,
+                amount: sent_amount,
+                day_of_month: 1,
+                valid_till_timestamp: 1825643152,
+                num_executed: 0,
+                last_executed_timestamp: 0,
+                is_active: false
+            }
+        );
+
+    println!("Mandate id:{}", mandate_id);
+    println!("Sender balance before:{}", erc20.balance_of(account_address));
+    println!("Recipient balance before:{}", erc20.balance_of(recipient));
+
+    let mut calldata = array![];
+
+    mandate_id.serialize(ref calldata);
+    let call = Call {
+        to: account_address, selector: selector!("execute_mandate"), calldata: calldata.span()
+    };
+    let mut calls = array![];
+    calls.append(call);
+    testing::set_block_timestamp(1727803152);
+
+    testing::set_contract_address(contract_address_const::<0x0>());
+    let ret_values = account.__execute__(calls);
+
+    println!("Sender balance after:{}", erc20.balance_of(account_address));
+    println!("Recipient balance after:{}", erc20.balance_of(recipient));
+
+    assert_eq!(erc20.balance_of(recipient), sent_amount);
+    assert_eq!(erc20.balance_of(account_address), 100 - sent_amount);
+//assert_eq!(is_valid, starknet::VALIDATED);
 }

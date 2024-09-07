@@ -182,9 +182,6 @@ pub mod MandateAccountComponent {
             // he can only do so once and then the mandate will just remain invalid
             let mut mandate: Mandate = self.Account_mandates.read(mandate_id);
 
-            let mut updated_mandate = Mandate { is_active: false, ..mandate };
-            self.Account_mandates.write(mandate_id, updated_mandate);
-
             if !mandate.is_active {
                 self
                     .emit(
@@ -194,6 +191,9 @@ pub mod MandateAccountComponent {
                     );
                 return false;
             }
+
+            let mut updated_mandate = Mandate { is_active: false, ..mandate };
+            self.Account_mandates.write(mandate_id, updated_mandate);
 
             // Re-read mandate from storage
             let mut mandate: Mandate = self.Account_mandates.read(mandate_id);
@@ -562,7 +562,7 @@ pub mod MandateAccountComponent {
             assert(is_valid, Errors::INVALID_SIGNATURE);
         }
 
-        /// Validates the mandate signature for the current transaction 
+        /// Validates the signature for the current transaction (including tx initiated by mandate public key) 
         /// Returns the short string `VALID` if valid, otherwise it reverts.
         fn validate_transaction_with_mandate(
             self: @ComponentState<TContractState>, mut tx_calls: Array<Call>
@@ -627,8 +627,7 @@ pub mod MandateAccountComponent {
                             *call.selector == selector!("execute_mandate"), Errors::INVALID_MANDATE
                         );
                         let mandate_id: u128 = (*((*call.calldata).at(0))).try_into().unwrap();
-                        println!("mandate id from calldata:{}", mandate_id);
-                        println!("Num mandates:{}", self.Account_num_mandates.read());
+                        
                         assert(
                             mandate_id < self.Account_num_mandates.read(),
                             Errors::INVALID_MANDATE_ID
